@@ -4,8 +4,9 @@
 #include <math.h>
 #include <sndfile.h>
 #include <fftw3.h>
+#include <string.h> // 需要引入 memmove 和 memcpy
 
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 1024  // 这里实际上我们使用 HOP_SIZE 作为读取单位
 #define HOP_SIZE 512
 #define FRAME_SIZE 1024
 
@@ -18,22 +19,35 @@ void calculate_magnitude(fftw_complex *in, double *out, int size) {
 
 // 简单的节拍检测：寻找能量峰值
 void detect_beats(double *energy, int num_frames, double *beat_times, int *num_beats) {
+    // 设置一个稍微高一点的阈值，避免静音噪音
+    // 简单的做法是：取前10帧的平均能量作为基准，然后乘以一个系数
     double threshold = 0.0;
+    if (num_frames > 10) {
+        double sum = 0.0;
+        for (int i = 0; i < 10; i++) sum += energy[i];
+        threshold = (sum / 10.0) * 1.5; // 阈值设为前段平均能量的1.5倍
+    }
+
     int min_distance = 5; // 最小节拍间隔（帧数）
     *num_beats = 0;
 
     for (int i = 1; i < num_frames - 1; i++) {
-        // 简单的峰值检测：当前能量大于前一个和后一个
-        if (energy[i] > energy[i-1] && energy[i] > energy[i+1]) {
-            // 检查是否是局部最大值
-            int is_peak = 1;
-            for (int j = 1; j <= min_distance; j++) {
-                if (i - j >= 0 && energy[i] <= energy[i - j]) { is_peak = 0; break; }
-                if (i + j < num_frames && energy[i] <= energy[i + j]) { is_peak = 0; break; }
-            }
-            if (is_peak) {
-                beat_times[*num_beats] = i * HOP_SIZE / (double)FRAME_SIZE;
-                (*num_beats)++;
+        // 1. 必须超过阈值
+        if (energy[i] > threshold) {
+            // 2. 简单的峰值检测：当前能量大于前一个和后一个
+            if (energy[i] > energy[i-1] && energy[i] > energy[i+1]) {
+                // 3. 检查是否是局部最大值（防止在同一个大波峰上检测到多个点）
+                int is_peak = 1;
+                for (int j = 1; j <= min_distance; j++) {
+                    if (i - j >= 0 && energy[i] <= energy[i - j]) { is_peak = 0; break; }
+                    if (i + j < num_frames && energy[i] <= energy[i + j]) { is_peak = 0; break; }
+                }
+                if (is_peak) {
+                    // 计算时间：当前帧索引 * 每一帧的时间跨度
+                    // 每一帧的时间跨度 = HOP_SIZE / 采样率
+                    beat_times[*num_beats] = i * (double)HOP_SIZE / sample_rate;
+                    (*num_beats)++;
+                }
             }
         }
     }
@@ -54,75 +68,104 @@ int main(int argc, char **argv) {
     }
 
     int sample_rate = sfinfo.samplerate;
-    int channels = sfinfo.channels;
+    // int channels = sfinfo.channels; // 简单起见，这里主要处理单声道或自动混合
     int total_frames = sfinfo.frames;
     printf("音频加载成功。时长: %.2f 秒, 采样率: %d Hz, 通道数: %d\n", 
-           (double)total_frames / sample_rate, sample_rate, channels);
+           (double)total_frames / sample_rate, sample_rate, sfinfo.channels);
+
+    // 预估最大可能的帧数 (总样本数 / HOP_SIZE) + 1
+    int max_frames = (total_frames / HOP_SIZE) + 1;
 
     // 分配内存
-    double *buffer = (double *)malloc(BUFFER_SIZE * sizeof(double));
+    // 1. 临时读取缓冲区，每次只读 HOP_SIZE 个样本
+    double *input_buffer = (double *)malloc(HOP_SIZE * sizeof(double));
+    
+    // 2. FFT 完整帧缓冲区 (用于保持滑动窗口)
+    double *frame_buffer = (double *)calloc(FRAME_SIZE, sizeof(double));
+    
     fftw_complex *fft_in = (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * FRAME_SIZE);
     fftw_complex *fft_out = (fftw_complex *)fftw_malloc(sizeof(fftw_complex) * FRAME_SIZE);
     double *magnitude = (double *)malloc(FRAME_SIZE * sizeof(double));
-    double *energy = (double *)malloc(total_frames / HOP_SIZE * sizeof(double));
-    double *beat_times = (double *)malloc(total_frames / HOP_SIZE * sizeof(double));
+    
+    // 3. 能量和节拍时间数组
+    double *energy = (double *)calloc(max_frames, sizeof(double));
+    double *beat_times = (double *)malloc(max_frames * sizeof(double));
+    
     int num_beats = 0;
+    int energy_index = 0; // 记录实际写入了多少帧能量数据
 
     // 创建 FFTW 计划
     fftw_plan plan = fftw_plan_dft_1d(FRAME_SIZE, fft_in, fft_out, FFTW_FORWARD, FFTW_ESTIMATE);
 
-    int frame_count = 0;
-    int read_count;
-    while ((read_count = sf_read_double(sndfile, buffer, BUFFER_SIZE)) > 0) {
-        // 处理音频数据
-        for (int i = 0; i < read_count; i++) {
-            if (frame_count < FRAME_SIZE) {
-                fft_in[frame_count][0] = buffer[i];
-                fft_in[frame_count][1] = 0.0;
-                frame_count++;
-            }
+    printf("开始处理...\n");
+
+    // 主循环：每次读取 HOP_SIZE 个样本
+    while (sf_read_double(sndfile, input_buffer, HOP_SIZE) > 0) {
+        // --- 核心修正：滑动窗口逻辑 ---
+        
+        // 1. 将旧数据向左移动：丢弃最左边的 HOP_SIZE 个，把后面的移过来
+        memmove(frame_buffer, frame_buffer + HOP_SIZE, HOP_SIZE * sizeof(double));
+        
+        // 2. 将新读取的数据复制到最右边的空位
+        memcpy(frame_buffer + HOP_SIZE, input_buffer, HOP_SIZE * sizeof(double));
+
+        // 3. 填充 FFT 输入 (取单声道或左声道)
+        for (int i = 0; i < FRAME_SIZE; i++) {
+            // 注意：如果原始音频是多声道，sf_read_double 会交错输出数据 (L R L R...)
+            // 简单的降采样处理：只取每个点的值，或者 (L+R)/2，这里简化为直接读取
+            // 如果是立体声，索引 i 实际上可能对应 i*channels。这里假设单声道或取值。
+            // 为了严格对应声道，应该乘 channels，但为保持代码结构简单，这里假设输入是单声道数据流
+            // 或者你可以改为: frame_buffer[i * sfinfo.channels]
+            
+            fft_in[i][0] = frame_buffer[i];
+            fft_in[i][1] = 0.0;
         }
 
-        // 当我们收集到一帧数据时
-        if (frame_count == FRAME_SIZE) {
-            // 执行 FFT
-            fftw_execute(plan);
-            
-            // 计算幅度
-            calculate_magnitude(fft_out, magnitude, FRAME_SIZE);
-            
-            // 计算能量（简化：只取前半部分，因为频谱是对称的）
-            double frame_energy = 0.0;
-            for (int i = 0; i < FRAME_SIZE / 2; i++) {
-                frame_energy += magnitude[i];
-            }
-            
-            // 存储能量
-            energy[frame_count / HOP_SIZE] = frame_energy;
-            
-            // 重置 frame_count 以便下一帧
-            frame_count = 0;
+        // 4. 执行 FFT
+        fftw_execute(plan);
+        
+        // 5. 计算幅度
+        calculate_magnitude(fft_out, magnitude, FRAME_SIZE);
+        
+        // 6. 计算能量（简化：只取前半部分）
+        double frame_energy = 0.0;
+        for (int i = 0; i < FRAME_SIZE / 2; i++) {
+            frame_energy += magnitude[i];
+        }
+        
+        // 7. 存储能量
+        if (energy_index < max_frames) {
+            energy[energy_index] = frame_energy;
+            energy_index++;
         }
     }
 
     // 关闭文件
     sf_close(sndfile);
+    free(input_buffer); // 及时释放
 
-    // 检测节拍
-    detect_beats(energy, total_frames / HOP_SIZE, beat_times, &num_beats);
+    printf("处理完成，共 %d 帧，开始检测节拍...\n", energy_index);
+
+    // 检测节拍 (传入实际处理的帧数 energy_index)
+    detect_beats(energy, energy_index, beat_times, &num_beats);
     printf("共检测到 %d 个节拍。\n", num_beats);
 
     // 打印节拍时间
-    printf("节拍时间戳 (秒):\n");
-    for (int i = 0; i < num_beats; i++) {
-        printf("%.4f\n", beat_times[i]);
+    if (num_beats > 0) {
+        printf("前20个节拍时间戳 (秒):\n");
+        int print_limit = num_beats < 20 ? num_beats : 20;
+        for (int i = 0; i < print_limit; i++) {
+            printf("%.4f ", beat_times[i]);
+            if ((i + 1) % 5 == 0) printf("\n");
+        }
+        printf("\n");
     }
 
     // 释放内存
     fftw_destroy_plan(plan);
     fftw_free(fft_in);
     fftw_free(fft_out);
-    free(buffer);
+    free(frame_buffer);
     free(magnitude);
     free(energy);
     free(beat_times);
