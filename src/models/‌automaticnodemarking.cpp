@@ -145,7 +145,9 @@ static int filter_get_audio(mlt_frame frame, void **buffer,
   // 2. 获取私有数据
   BeatMarkerPrivate *self = (BeatMarkerPrivate *)filter->child;
   if (!self) {
-    private_init(self);  // 如果还没初始化，初始化它
+    // 如果还没初始化，初始化它 (注意：这里逻辑其实有缺陷，正常流程应该在 init 中做)
+    // 但为了防止崩溃，做临时保护
+    return 0;
   }
 
   // 3. 获取原始音频数据
