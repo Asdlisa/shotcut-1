@@ -1,210 +1,212 @@
 /*
- * beat_detection_filter.cpp
+ * beatmarker.cpp
  * 
- * 这是一个 MLT 滤镜，用于检测音频中的节拍。
- * 基于 FFmpeg 的 RDFT (Real Discrete Fourier Transform) 实现。
- * 
- * 编译命令示例 (需链接 mlt++, avcodec, avutil):
- * g++ -shared -fPIC beat_detection_filter.cpp -o libmltbeat_detection.so \
- *    `mlt-config --cflags --libs` -lavcodec -lavutil -std=c++11
+ * 功能：基于 MLT 框架的节拍检测与分析模块
+ * 说明：
+ * 1. 这是一个基于能量检测的简单节拍器。
+ * 2. 它使用 FFmpeg (libavcodec) 进行 FFT 变换。
+ * 3. 它设计为可以被 MLT Filter 调用，或者作为一个独立的分析工具。
  */
 
+#include "models/models.h"
 #include <framework/mlt.h>
 #include <framework/mlt_filter.h>
 #include <framework/mlt_frame.h>
+#include <framework/mlt_log.h>
 
-#include <cstdlib>
-#include <cstring>
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <cstring>
 
-// 引入 FFmpeg 的 FFT 头文件
+// FFmpeg FFT 头文件
 extern "C" {
 #include <libavcodec/avfft.h>
 #include <libavutil/mem.h>
 }
 
-// === 常量定义 ===
-constexpr int FRAME_SIZE = 1024;  // FFT 窗口大小
-constexpr int HOP_SIZE = 512;     // 滑动窗口步长
-constexpr int ENERGY_HISTORY = 10;// 用于计算阈值的能量历史长度
+// === 配置常量 ===
+constexpr int FFT_SIZE = 1024;         // FFT 窗口大小
+constexpr int HOP_SIZE = 512;          // 滑动窗口步长
+constexpr int ENERGY_BUFFER_SIZE = 43; // 约 1 秒的历史能量 (43 * 512 / 44100 ≈ 0.5s，根据采样率调整)
+constexpr double C = 1.3;              // 常数系数，用于计算自适应阈值
 
-// === 滤镜私有数据结构 ===
-// 用于在滤镜实例中存储状态
-struct filter_data {
-    RDFTContext *rdft_ctx;         // FFmpeg RDFT 上下文
-    std::vector<double> window;   // 环形缓冲区
-    int write_pos;                // 写入位置
-    double *fft_in;               // FFT 输入缓冲区 (对齐内存)
-    double *fft_out;              // FFT 输出缓冲区
-    double *magnitude;            // 幅度谱
-    double *energy_history;       // 能量历史记录
-    int history_count;            // 当前历史记录计数
+// === 私有数据结构 ===
+typedef struct {
+    RDFTContext *rdft;          // FFmpeg RDFT 上下文
+    double *fft_in;             // FFT 输入缓冲区
+    double *fft_out;            // FFT 输出缓冲区
+    double *energy_buffer;      // 能量历史记录
+    int energy_index;           // 当前能量缓冲区写入位置
+    double avg_energy;          // 平均能量
+    bool is_initialized;        // 初始化标志
+} BeatMarkerPrivate;
+
+// 初始化私有数据
+static void private_init(BeatMarkerPrivate *self) {
+    self->rdft = av_rdft_init(log2(FFT_SIZE), DFT_R2C);
+    self->fft_in = (double*)av_malloc(sizeof(double) * FFT_SIZE);
+    self->fft_out = (double*)av_malloc(sizeof(double) * FFT_SIZE);
+    self->energy_buffer = (double*)av_malloc(sizeof(double) * ENERGY_BUFFER_SIZE);
     
-    filter_data() : rdft_ctx(nullptr), write_pos(0), history_count(0) {
-        window.resize(FRAME_SIZE * 2);
-        // 使用 av_malloc 确保内存对齐 (FFTW/FFmpeg SSE优化需要)
-        fft_in = (double*)av_malloc(sizeof(double) * FRAME_SIZE);
-        fft_out = (double*)av_malloc(sizeof(double) * FRAME_SIZE);
-        magnitude = (double*)av_malloc(sizeof(double) * (FRAME_SIZE / 2));
-        energy_history = (double*)av_malloc(sizeof(double) * ENERGY_HISTORY);
-        
-        std::fill(window.begin(), window.end(), 0.0);
-        std::fill(energy_history, energy_history + ENERGY_HISTORY, 0.0);
-    }
-
-    ~filter_data() {
-        if (rdft_ctx) av_rdft_end(rdft_ctx);
-        av_free(fft_in);
-        av_free(fft_out);
-        av_free(magnitude);
-        av_free(energy_history);
-    }
-};
-
-// === 辅助函数：将交错的音频混合为单声道 ===
-void mix_to_mono(const int16_t *input, int samples, int channels, std::vector<double> &output) {
-    output.resize(samples);
-    for (int i = 0; i < samples; ++i) {
-        double sum = 0;
-        for (int ch = 0; ch < channels; ++ch) {
-            sum += input[i * channels + ch];
-        }
-        output[i] = sum / channels;
-    }
+    // 清零
+    memset(self->energy_buffer, 0, sizeof(double) * ENERGY_BUFFER_SIZE);
+    self->energy_index = 0;
+    self->avg_energy = 0.0;
+    self->is_initialized = (self->rdft != nullptr);
 }
 
-// === 核心：处理一帧音频 ===
+// 释放私有数据
+static void private_close(BeatMarkerPrivate *self) {
+    if (self->rdft) av_rdft_end(self->rdft);
+    if (self->fft_in) av_free(self->fft_in);
+    if (self->fft_out) av_free(self->fft_out);
+    if (self->energy_buffer) av_free(self->energy_buffer);
+    self->is_initialized = false;
+}
+
+// === 核心算法：计算频谱能量 ===
+static double calculate_band_energy(const double *fft_out, int low_bin, int high_bin) {
+    double energy = 0.0;
+    for (int i = low_bin; i <= high_bin && i < FFT_SIZE / 2; ++i) {
+        double re = fft_out[2 * i];
+        double im = fft_out[2 * i + 1];
+        energy += sqrt(re * re + im * im);
+    }
+    return energy;
+}
+
+// === 核心：检测节拍 ===
+// 输入：单声道音频数据，样本数
+// 返回：检测到节拍返回 true
+static bool detect_beat(BeatMarkerPrivate *self, const double *samples, int num_samples, int sample_rate) {
+    if (!self->is_initialized) return false;
+
+    // 1. 环形缓冲区填充 (简化版：假设 num_samples == HOP_SIZE)
+    // 实际生产中需要维护一个环形缓冲区，这里为了演示，直接使用传入的样本
+    // 我们假设调用方已经管理好了滑动窗口
+
+    // 2. 准备 FFT 输入 (应用汉宁窗)
+    for (int i = 0; i < FFT_SIZE; ++i) {
+        // 简单的汉宁窗窗函数
+        double window = 0.5 * (1.0 - cos(2.0 * M_PI * i / (FFT_SIZE - 1)));
+        self->fft_in[i] = samples[i] * window;
+    }
+
+    // 3. 执行 FFT
+    av_rdft_calc(self->rdft, self->fft_in, self->fft_out);
+
+    // 4. 计算低频能量 (通常是鼓点所在的频段)
+    // 假设采样率 44100，FFT_SIZE 1024，每个 bin 约 43Hz
+    // Bass 通常在 0 - 250Hz 之间，即 bin 0 - 6
+    double current_energy = calculate_band_energy(self->fft_out, 1, 5);
+
+    // 5. 更新平均能量 (简单移动平均)
+    self->energy_buffer[self->energy_index] = current_energy;
+    self->energy_index = (self->energy_index + 1) % ENERGY_BUFFER_SIZE;
+
+    // 计算缓冲区内的局部平均能量
+    double local_avg = 0.0;
+    for (int i = 0; i < ENERGY_BUFFER_SIZE; ++i) {
+        local_avg += self->energy_buffer[i];
+    }
+    local_avg /= ENERGY_BUFFER_SIZE;
+
+    // 6. 节拍判定逻辑
+    // 如果当前能量 > 平均能量 * 常数，则认为是节拍
+    // 为了避免重复触发，这里可以加入冷却时间逻辑
+    bool is_beat = false;
+    if (current_energy > local_avg * C) {
+        // 这里可以添加：局部峰值检测
+        // 比如 current_energy > prev_energy && current_energy > next_energy
+        is_beat = true;
+    }
+    
+    // 调试输出
+    // mlt_log_info(NULL, "Energy: %f, Avg: %f, Beat: %d\n", current_energy, local_avg, is_beat);
+
+    return is_beat;
+}
+
+// === MLT 滤镜接口 (集成部分) ===
+
+// 获取音频的回调函数
 static int filter_get_audio(mlt_frame frame, void **buffer, mlt_audio_format *format, int *frequency, int *channels, int *samples) {
     // 1. 获取滤镜实例
     mlt_filter filter = (mlt_filter)mlt_frame_pop_audio(frame);
     
     // 2. 获取私有数据
-    filter_data *data = (filter_data*)filter->child;
+    BeatMarkerPrivate *self = (BeatMarkerPrivate*)filter->child;
+    if (!self) {
+        private_init(self); // 如果还没初始化，初始化它
+    }
 
     // 3. 获取原始音频数据
-    // 我们强制请求 mlt_audio_s16 格式，这是最通用的整数格式
+    // 请求 s16 格式，这是最通用的
     *format = mlt_audio_s16;
     int error = mlt_frame_get_audio(frame, buffer, format, frequency, channels, samples);
     if (error) return error;
 
+    // 4. 转换为双精度浮点并进行声道混合
+    // 为了计算 FFT，我们需要连续的单声道浮点数据
     const int16_t *audio_in = (const int16_t *)*buffer;
-
-    // 4. 转换为浮点单声道数据
-    std::vector<double> mono_samples;
-    mix_to_mono(audio_in, *samples, *channels, mono_samples);
-
-    // 5. 初始化 RDFT (如果尚未初始化)
-    if (!data->rdft_ctx) {
-        // DFT_R2C: Real to Complex (实数输入，复数输出)
-        data->rdft_ctx = av_rdft_init(log2(FRAME_SIZE), DFT_R2C);
-    }
-
-    // 6. 将样本填入环形缓冲区
-    for (int i = 0; i < *samples; ++i) {
-        data->window[data->write_pos] = mono_samples[i];
-        data->window[data->write_pos + FRAME_SIZE] = mono_samples[i]; // 镜像，方便读取
-        data->write_pos = (data->write_pos + 1) % FRAME_SIZE;
-    }
-
-    // 7. 对每一帧的步长进行处理
-    // 我们不希望对每个样本都做 FFT，太慢了。每当缓冲区填满 HOP_SIZE 时，我们处理一次。
-    // 为了简化，我们这里假设 samples 比较大，或者我们只要处理最近的窗口。
-    // 注意：真实的流式处理需要更复杂的计数器逻辑，这里为了演示完整性，
-    // 我们只对当前缓冲区中最新的一个完整窗口进行分析。
     
-    // 构造当前帧的 FFT 输入
-    // 从 write_pos 回溯 FRAME_SIZE 个样本
-    for (int i = 0; i < FRAME_SIZE; ++i) {
-        int read_pos = (data->write_pos - FRAME_SIZE + i + FRAME_SIZE) % FRAME_SIZE;
-        data->fft_in[i] = data->window[read_pos];
+    // 临时的单声道缓冲区
+    std::vector<double> mono_samples(*samples);
+    for (int i = 0; i < *samples; ++i) {
+        double sum = 0;
+        for (int ch = 0; ch < *channels; ++ch) {
+            sum += audio_in[i * *channels + ch];
+        }
+        mono_samples[i] = sum / *channels;
     }
 
-    // 8. 执行 FFT
-    if (data->rdft_ctx) {
-        av_rdft_calc(data->rdft_ctx, data->fft_in, data->fft_out);
-
-        // 9. 计算幅度谱
-        // FFmpeg RDFT 输出: [r0, re1, im1, re2, im2, ...]
-        for (int i = 0; i < FRAME_SIZE / 2; ++i) {
-            double re = data->fft_out[2 * i];
-            double im = data->fft_out[2 * i + 1];
-            data->magnitude[i] = sqrt(re * re + im * im);
-        }
-
-        // 10. 计算能量
-        double current_energy = 0;
-        for (int i = 0; i < FRAME_SIZE / 2; ++i) {
-            current_energy += data->magnitude[i];
-        }
-
-        // 11. 节拍检测逻辑
-        double threshold = 0.0;
-        double sum = 0.0;
-        int count = 0;
-        for (int i = 0; i < ENERGY_HISTORY; ++i) {
-            sum += data->energy_history[i];
-            if (data->energy_history[i] > 0.0001) count++;
-        }
+    // 5. 调用核心检测算法
+    // 注意：这里每次处理的是一帧（例如 4096 个样本），而我们的 FFT 窗口只有 1024
+    // 真实的实现需要在一个大的环形缓冲区中滑动处理
+    // 这里为了演示，我们只取这一帧的前 1024 个样本进行处理
+    int samples_to_process = std::min(*samples, FFT_SIZE);
+    
+    if (detect_beat(self, mono_samples.data(), samples_to_process, *frequency)) {
+        // === 检测到节拍！ ===
         
-        if (count > 0) {
-            double avg = sum / count;
-            threshold = avg * 1.5; // 简单的自适应阈值
-        } else {
-            threshold = 0.01;
-        }
-
-        // 12. 更新历史
-        // 滚动更新
-        for (int i = 0; i < ENERGY_HISTORY - 1; ++i) {
-            data->energy_history[i] = data->energy_history[i+1];
-        }
-        data->energy_history[ENERGY_HISTORY - 1] = current_energy;
-
-        // 13. 判断是否为节拍
-        if (current_energy > threshold) {
-            // 在这里触发节拍事件
-            // 例如：打印日志，或者通过 mlt_properties_set 设置一个属性供 QML 检测
-            // mlt_properties props = MLT_FILTER_PROPERTIES(filter);
-            // mlt_properties_set_double(props, "beat_detected", mlt_properties_get_double(props, "_time"));
-            
-            fprintf(stderr, "BEAT DETECTED! Energy: %f, Threshold: %f\n", current_energy, threshold);
-        }
+        // 获取当前帧的时间位置 (秒)
+        mlt_position position = mlt_frame_get_position(frame);
+        double time_sec = (double)position / mlt_profile_fps(mlt_frame_profile(frame));
+        
+        mlt_log_info(NULL, "[BeatMarker] BEAT DETECTED at %.2f sec\n", time_sec);
+        
+        // TODO: 在这里可以将时间信息写入 filter 的属性中
+        // mlt_properties props = MLT_FILTER_PROPERTIES(filter);
+        // mlt_properties_set_double(props, "_last_beat_time", time_sec);
     }
 
     return 0;
 }
 
-// === MLT 滤镜构造函数 (入口点) ===
+// === 构造函数与析构函数 (C 风格导出) ===
+
 extern "C" {
     
-    // 初始化函数
-    mlt_filter filter_beat_detection_init(mlt_profile profile, mlt_service_type type, const char *id, char *arg) {
-        // 创建滤镜对象
+    mlt_filter beatmarker_filter_init(mlt_profile profile, mlt_service_type type, const char *id, char *arg) {
         mlt_filter filter = mlt_filter_new();
         if (!filter) return NULL;
 
-        // 分配私有数据
-        filter_data *data = new filter_data();
-        if (!data) {
-            mlt_filter_close(filter);
-            return NULL;
-        }
+        // 分配并初始化私有数据
+        BeatMarkerPrivate *self = new BeatMarkerPrivate();
+        private_init(self);
         
-        filter->child = data;
-        
-        // 设置处理音频的回调
-        // 当 MLT 管道请求音频时，会调用这个函数
-        filter->process = filter_get_audio;
+        filter->child = self;
+        filter->process = filter_get_audio; // 注册音频处理回调
 
         return filter;
     }
 
-    // 关闭函数 (可选，MLT 会在 service 关闭时自动调用 child 的析构函数，但清理工作最好显式做)
-    void filter_beat_detection_close(mlt_filter filter) {
+    void beatmarker_filter_close(mlt_filter filter) {
         if (filter) {
-            delete (filter_data*)filter->child;
+            BeatMarkerPrivate *self = (BeatMarkerPrivate*)filter->child;
+            private_close(self);
+            delete self;
             filter->child = nullptr;
             mlt_filter_close(filter);
         }
